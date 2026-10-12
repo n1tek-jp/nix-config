@@ -4,7 +4,7 @@ macOS と NixOS の開発環境（パッケージ、シェル、エディタ、�
 
 設計と理由は [docs/architecture.md](docs/architecture.md) にある。
 
-この公開リポジトリは共通の土台を管理する。`layers/local`・`layers/organizations`・`layers/user` は `.gitkeep` だけを置き、内容をGitの対象から除く。個人用の独立したprivateリポジトリでは、user・organizationsの除外を外して必要な設定を追加する。
+この公開リポジトリは共通の土台を管理する。`layers/local`・`layers/organizations`・`layers/user` は、それぞれの `.gitignore` で内容を除外し、`.gitignore` と `.gitkeep` だけを共有する。個人用の独立したprivateリポジトリでは、`layers/user/.gitignore` と `layers/organizations/.gitignore` を削除して設定をGit管理する。`layers/local/.gitignore` は残す。
 
 ## こんなときは
 

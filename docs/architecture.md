@@ -37,7 +37,7 @@ docs/
 
 既定の優先順位は強い順に `local > user > organizations/<名前順> > common`。`layers/local/.env.d/override-layer-priorities.nix` が返す文字列リストで順序を変更できる。重複や存在しないレイヤーを指定すると評価が止まる。
 
-`common` は合理的に共通化できるツール、`user` はエディタ・フォント・キーバインドなどの好み、`organizations` は組織の設定、`local` は端末固有の設定を持つ。アカウント情報や秘密はレイヤーのNixコードに書かず、`layers/user/.env.d/*.sops` に置く。暗号文・公開鍵情報・ひな形はGit管理する。公開版ではlocal・organizations・userを.gitkeep以外すべてGit除外する。個人用privateリポジトリではuser・organizationsを追跡し、localは.gitkeepだけを追跡する。
+`common` は合理的に共通化できるツール、`user` はエディタ・フォント・キーバインドなどの好み、`organizations` は組織の設定、`local` は端末固有の設定を持つ。アカウント情報や秘密はレイヤーのNixコードに書かず、`layers/user/.env.d/*.sops` に置く。暗号文・公開鍵情報・ひな形はGit管理する。公開版ではlocal・organizations・userの各ディレクトリに `.gitignore` を置き、`.gitignore` と `.gitkeep` 以外を除外する。個人用privateリポジトリはuser・organizationsの `.gitignore` を削除して内容を追跡し、localの `.gitignore` は残す。ルートの `.gitignore` は両リポジトリで共通とする。
 
 1つのツール・目的につき1つのコンテキストとし、そのインストールと設定をまとめる。Homebrewや `.zshrc` 全体の単位にまとめない。同じツールでも、本体が共通ならcommon、個人の設定はuserに分ける。例はVS CodeとAWS CLI。
 
