@@ -1,0 +1,9 @@
+# 個人・組織・端末のレイヤーは公開しない。置き場所だけを共有する。
+/layers/local/**
+!/layers/local/.gitkeep
+/layers/organizations/**
+!/layers/organizations/.gitkeep
+/layers/user/**
+!/layers/user/.gitkeep
+
+/flake.lock.backup

@@ -1,0 +1,77 @@
+# switch が置き換える前にバックアップするファイルの一覧。
+# ここに書いたファイルが存在していて Nix の管理外（Nix ストアか /etc/static を指すリンクでない）なら、
+# switch は適用の前に ~/.local/state/nix-config/backups/<ID>/files/<元の絶対パス> へ移す。
+# 適用が完了しなければ、移したまま空いている場所に元のファイルを戻す。手で戻すときは switch restore [<ID>]。
+#
+# 書くもの:
+#   - Nix が置くファイルのうち、既にあると適用が止まりうるもの。一度置けば Nix のリンクになるので、次の switch からは飛ばされる
+#   - 残っていると、Nix の設定やコマンドより優先されてしまうもの
+# ツールが普段書き換えるファイルは書かない（switch のたびに移されてしまう）。
+#
+# 書き方: 1行に1つ。~/ で始まるパスか絶対パスで書く。何も無い行と、行頭が # の行は無視する。
+# 行の途中のコメント、行末の空白、空白だけの行は書けない（switch がビルドの前に誤りとして止まる）。
+# ディレクトリは対象にならない（書いても警告して飛ばす。ディレクトリを指すリンクはリンクとして移す）。
+# /etc のように自分で書き込めない場所は sudo で移す。
+
+# zsh（Home Manager）
+~/.zshrc
+~/.zshenv
+~/.zprofile
+
+# Git（Home Manager）。~/.gitconfig は Nix の設定（~/.config/git/config）より後に読まれ、値を上書きしてしまう
+~/.config/git/config
+~/.gitconfig
+
+# GitHub CLI（Home Manager）。hosts.yml（ログインの情報）は Nix が管理しないので書かない
+~/.config/gh/config.yml
+
+# AWS の復号先リンクは毎回退避しない。移行時の競合だけ個別に対処する。
+
+# asdf（Home Manager）
+~/.asdfrc
+
+# VS Code（Home Manager）。settings.json は macOS と Linux で場所が違う
+~/.vscode/argv.json
+~/Library/Application Support/Code/User/settings.json
+~/.config/Code/User/settings.json
+
+# uv と bun の公式インストーラーが置いたコマンド。PATH で Nix 版より前に来てしまう
+# uv 0.5 より前のインストーラーは ~/.cargo/bin に置いた（rustup.nix により PATH の先頭）
+~/.local/bin/uv
+~/.local/bin/uvx
+~/.cargo/bin/uv
+~/.cargo/bin/uvx
+~/.bun/bin/bun
+~/.bun/bin/bunx
+
+# rustup の公式インストーラーが ~/.cargo/bin に置いた本体と代理コマンド。PATH で Nix 版の rustup より前に来てしまう
+~/.cargo/bin/rustup
+~/.cargo/bin/cargo
+~/.cargo/bin/cargo-clippy
+~/.cargo/bin/cargo-fmt
+~/.cargo/bin/cargo-miri
+~/.cargo/bin/clippy-driver
+~/.cargo/bin/rls
+~/.cargo/bin/rust-analyzer
+~/.cargo/bin/rust-gdb
+~/.cargo/bin/rust-gdbgui
+~/.cargo/bin/rust-lldb
+~/.cargo/bin/rustc
+~/.cargo/bin/rustdoc
+~/.cargo/bin/rustfmt
+
+# macOS の /etc（nix-darwin）。NixOS では Nix の管理下にあるか存在しないので飛ばされる
+# zshrc と bashrc は、Nix の公式インストーラーが先頭に行を足すため、nix-darwin が知らない内容になる
+/etc/zshrc
+/etc/zshenv
+/etc/zprofile
+/etc/bashrc
+/etc/resolver/localhost
+# Nix の設定。インストーラーが書いたままなら nix-darwin が自分で退避するが、編集してあると止まる。
+# 移した後も使う設定は、Nix の設定（nix.settings）として書き直す
+/etc/nix/nix.conf
+# sudo の Touch ID などの設定。nix-darwin は空の版を置く。
+# Touch ID を使い続けるなら、user レイヤーの darwin に security.pam.services.sudo_local.touchIdAuth = true を書く
+/etc/pam.d/sudo_local
+# SMB クライアントの設定（user/nsmb.nix）
+/etc/nsmb.conf

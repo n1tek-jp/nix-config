@@ -1,0 +1,433 @@
+#!/bin/sh
+# この設定を端末へ適用する。初回の導入と、設定を変えた後の反映の両方に使う。
+#   switch                設定を適用する（macOS で Nix が無ければ公式インストーラーで入れる）。
+#                         backup-targets.txt にあるファイルのうち Nix が管理していないものは、
+#                         ~/.local/state/nix-config/backups/<ID>/ へ移してから適用する。
+#                         適用が完了しなければ、移したまま空いている場所に元のファイルを戻す
+#   switch update         flake.lock を更新する（適用はしない。更新前の lock を flake.lock.backup に残す）
+#   switch restore [ID]   バックアップしたファイルを元の場所に戻す（ID を省くと最新の回）
+# Linux は NixOS のみ対応。
+set -eu
+
+config_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+user_name=$(id -un)
+home_directory=$HOME
+kernel=$(uname -s)
+machine=$(uname -m)
+
+# nix-darwin が管理する Nix と同じリリースを入れ、初回の switch で版が変わらないようにする。
+nix_installer_version=2.34.8
+nix_installer_sha256=96c10e102c88809dd9ec0bee89200c4a51eae4c9f6d8698c26b16788d131e078
+nix_daemon_profile=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+
+# 置き換える前にバックアップするファイルの一覧と、バックアップの置き場所。
+# バックアップをこのディレクトリの中に置かないのは、switch がこのディレクトリを丸ごと
+# Nix ストア（端末の誰でも読める）にコピーするため。
+backup_targets="$config_dir/backup-targets.txt"
+backup_root="$home_directory/.local/state/nix-config/backups"
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage="使い方: switch | switch update | switch secrets | switch restore [ID]"
+case "${1:-}" in
+  "") mode=switch ;;
+  update) mode=update ;;
+  secrets) mode=secrets ;;
+  restore) mode=restore ;;
+  *) die "$usage" ;;
+esac
+if [ "$mode" = restore ]; then
+  [ $# -le 2 ] || die "$usage"
+  restore_id=${2:-}
+else
+  [ $# -le 1 ] || die "$usage"
+fi
+
+[ "$(id -u)" -ne 0 ] ||
+  die "switch は sudo を付けずに自分のユーザーで実行してください（必要な箇所で switch が sudo を使います）"
+
+case "$kernel:$machine" in
+  Darwin:arm64) host_system=aarch64-darwin ;;
+  Darwin:x86_64) host_system=x86_64-darwin ;;
+  Linux:aarch64 | Linux:arm64) host_system=aarch64-linux ;;
+  Linux:x86_64) host_system=x86_64-linux ;;
+  *) die "Unsupported platform: $kernel/$machine" ;;
+esac
+
+if [ "$kernel" = Linux ] && [ ! -e /etc/NIXOS ]; then
+  die "Linux は NixOS のみ対応しています"
+fi
+
+install_nix() {
+  installer=$(mktemp)
+  trap 'rm -f "$installer"' EXIT
+  printf 'Nix が見つからないため、公式インストーラー（%s）で導入します。\n' "$nix_installer_version"
+  curl --proto '=https' --tlsv1.2 -fsSL \
+    "https://releases.nixos.org/nix/nix-$nix_installer_version/install" -o "$installer"
+  printf '%s  %s\n' "$nix_installer_sha256" "$installer" | shasum -a 256 -c - >/dev/null ||
+    die "Nix インストーラーのハッシュが一致しません"
+  sh "$installer" --daemon --yes
+  rm -f "$installer"
+  trap - EXIT
+}
+
+ensure_nix() {
+  if command -v nix >/dev/null 2>&1; then
+    return 0
+  fi
+  [ "$kernel" = Darwin ] || die "nix コマンドが見つかりません"
+  if [ ! -x /nix/var/nix/profiles/default/bin/nix ]; then
+    install_nix
+  fi
+  unset __ETC_PROFILE_NIX_SOURCED
+  set +u
+  # shellcheck source=/dev/null
+  . "$nix_daemon_profile"
+  set -u
+}
+
+# 以下のバックアップと戻しの処理では、パスの加工にコマンド置換（$(...)）を使わない。
+# 出力先が壊れた後の bash 3.2（macOS の /bin/sh）は、書けなかった出力をコマンド置換の結果に混ぜるため。
+
+# 親ディレクトリのパスを parent_path に入れる（dirname と同じ結果）。
+parent_of() {
+  parent_path=${1%/*}
+  [ -n "$parent_path" ] || parent_path=/
+}
+
+# Nix が置いたもの（Nix ストアか /etc/static を指すリンク）なら真。
+is_nix_managed() {
+  [ -L "$1" ] || return 1
+  case $(readlink "$1") in
+    /nix/store/* | /etc/static/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 第1引数のパスを作る・消す・移すのに必要な権限で、残りのコマンドを実行する。
+# ホームの下は自分の権限で行う。それ以外は、存在する最も近い親ディレクトリに書き込めなければ sudo を使う（/etc など）。
+as_owner_of() {
+  owner_path=$1
+  shift
+  case $owner_path in
+    "$home_directory"/*)
+      "$@"
+      return
+      ;;
+  esac
+  parent_of "$owner_path"
+  while [ ! -d "$parent_path" ] && [ "$parent_path" != / ]; do
+    parent_of "$parent_path"
+  done
+  if [ -w "$parent_path" ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+# backup-targets.txt を読み、1行に1つの絶対パスにして出力する。
+# 何も無い行と、行頭が # の行は飛ばす。先頭の ~/ はホームに置き換え、末尾の / は取り除く。
+# 行の途中のコメント、行末の空白、空白だけの行は、パスの一部と区別できないので誤りとする。
+read_backup_targets() {
+  [ -f "$backup_targets" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      '' | '#'*) continue ;;
+      *[[:space:]]'#'* | *[[:space:]])
+        printf 'error: %s: 行の途中のコメント、行末の空白、空白だけの行は書けません: %s\n' "$backup_targets" "$line" >&2
+        return 1
+        ;;
+    esac
+    line=${line%/}
+    case $line in
+      \~/?*) printf '%s\n' "$home_directory/${line#\~/}" ;;
+      /?*) printf '%s\n' "$line" ;;
+      *)
+        printf 'error: %s: 絶対パスか ~/ で始まるパスを書いてください: %s\n' "$backup_targets" "$line" >&2
+        return 1
+        ;;
+    esac
+  done <"$backup_targets"
+}
+
+# 一覧のファイルのうち、存在していて Nix が管理していないものをバックアップへ移す。
+# 移した先は $backup_dir/files/<元の絶対パス>、移したパスは $backup_dir/manifest に1行ずつ記録する。
+# 何も移さなければ $backup_dir は空文字列のままにする。
+backup_dir=""
+backup_conflicts() {
+  [ -n "$targets" ] || return 0
+  # ID は UTC の日時。名前の順が時刻の順になる（タイムゾーンを変えても崩れない）。
+  new_backup="$backup_root/$(date -u +%Y%m%d-%H%M%SZ)"
+  # 同じ秒の回があれば、1秒待って付け直す。
+  while [ -e "$new_backup" ]; do
+    sleep 1
+    new_backup="$backup_root/$(date -u +%Y%m%d-%H%M%SZ)"
+  done
+  (umask 077 && mkdir -p "$backup_root" && mkdir "$new_backup")
+  while IFS= read -r target; do
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+      continue
+    fi
+    if is_nix_managed "$target"; then
+      continue
+    fi
+    if [ -d "$target" ] && [ ! -L "$target" ]; then
+      printf 'warning: ディレクトリは置き換えの対象にしないため飛ばします: %s\n' "$target" >&2
+      continue
+    fi
+    if [ -z "$backup_dir" ]; then
+      backup_dir=$new_backup
+      printf 'Nix が管理していない次のファイルを %s へ移してから適用します。\n' "$backup_dir"
+    fi
+    stored="$backup_dir/files$target"
+    parent_of "$stored"
+    mkdir -p "$parent_path"
+    # 先に記録してから移す（移した後に中断されても、記録の無いファイルが残らないように）。
+    printf '%s\n' "$target" >>"$backup_dir/manifest"
+    as_owner_of "$target" mv -- "$target" "$stored"
+    printf '  %s\n' "$target"
+  done <<TARGETS
+$targets
+TARGETS
+  [ -n "$backup_dir" ] || rmdir "$new_backup"
+}
+
+# バックアップ（第1引数のディレクトリ）を元の場所に戻す。
+# 第2引数が all なら、戻し先にある Nix のリンクを外してから戻す（switch restore）。
+# missing なら、戻し先が空いているものだけを戻し、Nix が置き換え終えたものはそのままにする（適用が完了しなかったとき）。
+# 戻し先に Nix のもの以外があれば上書きしない。戻せないものがあれば偽を返す。
+# 戻していないファイルがバックアップに残っていなければ、バックアップを片付ける。
+restore_backup() {
+  restore_from=$1
+  restore_mode=$2
+  restore_ok=0
+  while IFS= read -r target; do
+    stored="$restore_from/files$target"
+    if [ ! -e "$stored" ] && [ ! -L "$stored" ]; then
+      continue
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      [ "$restore_mode" = all ] || continue
+      if ! is_nix_managed "$target"; then
+        printf 'warning: 別のファイルがあるため戻しません: %s（バックアップ: %s）\n' "$target" "$stored" >&2
+        restore_ok=1
+        continue
+      fi
+      if ! as_owner_of "$target" rm -f -- "$target"; then
+        printf 'warning: Nix のリンクを外せませんでした: %s（バックアップ: %s）\n' "$target" "$stored" >&2
+        restore_ok=1
+        continue
+      fi
+    fi
+    parent_of "$target"
+    target_dir=$parent_path
+    if { [ -d "$target_dir" ] || as_owner_of "$target_dir" mkdir -p -- "$target_dir"; } &&
+      as_owner_of "$target" mv -- "$stored" "$target"; then
+      printf '  %s\n' "$target"
+    else
+      printf 'warning: 戻せませんでした: %s（バックアップ: %s）\n' "$target" "$stored" >&2
+      restore_ok=1
+    fi
+  done <"$restore_from/manifest"
+  # 空のディレクトリだけを消す。ファイルが残っていれば files/ は消えないので、途中で中断されても何も失わない。
+  find "$restore_from/files" -depth -type d -empty -delete 2>/dev/null || :
+  if [ ! -e "$restore_from/files" ]; then
+    rm -f -- "$restore_from/manifest"
+    rmdir -- "$restore_from" 2>/dev/null || :
+  fi
+  return "$restore_ok"
+}
+
+# この回に移したファイルのうち、元の場所が空いたままのものを戻す。戻せないものがあれば偽を返す。
+put_back_moved_files() {
+  [ -n "$backup_dir" ] || return 0
+  put_back_ok=0
+  printf '移したまま空いている場所に、元のファイルを戻します。\n' >&2
+  if ! restore_backup "$backup_dir" missing; then
+    printf 'warning: 戻せなかったファイルがあります。\n' >&2
+    put_back_ok=1
+  fi
+  if [ -d "$backup_dir" ]; then
+    printf '戻していないファイルのバックアップは %s にあります。元に戻すには %s restore %s を実行します。\n' \
+      "$backup_dir" "$0" "${backup_dir##*/}" >&2
+  fi
+  backup_dir=""
+  return "$put_back_ok"
+}
+
+# switch の途中で失敗したり中断したりしたら、この回に移したファイルを戻す。
+# 戻している最中は、出力先が無くなっても、中断されても止めない（sudo などの子は従来どおり中断できる）。
+switch_completed=0
+on_switch_exit() {
+  exit_status=$?
+  trap - EXIT
+  set +e
+  trap '' PIPE
+  trap ':' HUP INT TERM
+  if [ "$switch_completed" -ne 1 ] && [ -n "$backup_dir" ]; then
+    # 出力先が使えなければ捨てる（書けない出力が溜まり続けないように）。
+    printf '適用が完了しませんでした。\n' >&2 || exec >/dev/null 2>&1
+    put_back_moved_files
+  fi
+  exit "$exit_status"
+}
+
+# 適用のコマンドを動かす。終了コードは apply_status に入れる。
+# 動いている間に受けた中断は pending_signal に記録し、コマンドが終わってから扱う（成功した適用を巻き戻さないため）。
+pending_signal=""
+run_apply() {
+  trap 'pending_signal=129' HUP
+  trap 'pending_signal=130' INT
+  trap 'pending_signal=143' TERM
+  apply_status=0
+  "$@" || apply_status=$?
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+# 中断を受けていれば、その終了コードで終わる。
+exit_if_interrupted() {
+  [ -z "$pending_signal" ] || exit "$pending_signal"
+}
+
+restore_command() {
+  if [ -z "$restore_id" ]; then
+    for candidate in "$backup_root"/*/manifest; do
+      [ -f "$candidate" ] || continue
+      restore_id=$(basename -- "$(dirname -- "$candidate")")
+    done
+    [ -n "$restore_id" ] || die "戻せるバックアップがありません（${backup_root}）"
+  fi
+  case $restore_id in
+    */* | . | ..) die "ID の書き方が違います: $restore_id" ;;
+  esac
+  [ -f "$backup_root/$restore_id/manifest" ] ||
+    die "バックアップ $restore_id がありません。$backup_root にあるものから選んでください"
+  printf 'バックアップ %s を元の場所に戻します。\n' "$restore_id"
+  restore_backup "$backup_root/$restore_id" all ||
+    die "戻せなかったファイルがあります。表示されたファイルを確かめてから、もう一度 switch restore $restore_id を実行してください"
+  printf '戻しました。次に switch を実行すると、もう一度バックアップしてから置き換えます。\n'
+}
+
+if [ "$mode" = restore ]; then
+  restore_command
+  exit 0
+fi
+
+# 一覧の書き方の誤りは、時間のかかるビルドの前に知らせる。
+if [ "$mode" = switch ]; then
+  targets=$(read_backup_targets) || exit 1
+fi
+
+# path: は gitignore に関係なくコピーするので、評価の前に平文を拒否する。
+env_dir="$config_dir/layers/user/.env.d"
+for entry in "$env_dir"/* "$env_dir"/.[!.]*; do
+  [ -f "$entry" ] || continue
+  case ${entry##*/} in *.sops|*.example|.sops.yaml) ;;
+    *) die "layers/user/.env.d に平文の設定があります。READMEの『自分の情報を登録する』に従ってください" ;;
+  esac
+done
+
+ensure_nix
+
+export NIX_CONFIG_USER="$user_name"
+export NIX_CONFIG_HOME="$home_directory"
+export NIX_CONFIG_SYSTEM="$host_system"
+flake="path:$config_dir#default"
+
+if [ "$mode" = update ]; then
+  cp "$config_dir/flake.lock" "$config_dir/flake.lock.backup"
+  nix --extra-experimental-features "nix-command flakes" flake update --flake "path:$config_dir"
+  printf '更新前の lock を flake.lock.backup に残しました。差分を確かめてから switch で適用します。\n'
+  exit 0
+fi
+
+trap on_switch_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 141' PIPE
+trap 'exit 143' TERM
+
+secret_state="$home_directory/.local/state/nix-config/secrets"
+secret_identities="$home_directory/.config/sops/age/nix-config-yubikeys.txt"
+secret_tools=""
+for cipher in "$env_dir"/*.sops; do
+  [ -f "$cipher" ] || continue
+  name=${cipher##*/}; name=${name%.sops}
+  if [ ! -f "$secret_state/$name" ] || [ -L "$secret_state/$name" ] ||
+    ! cmp -s "$cipher" "$secret_state/.$name.sops"; then
+    secret_tools=$(nix --extra-experimental-features "nix-command flakes" \
+      build --impure --no-link --print-out-paths "path:$config_dir#packages.$host_system.secret-tools")
+    break
+  fi
+done
+sh "$config_dir/scripts/sync-secrets.sh" sync "$env_dir" "$secret_state" "$secret_tools" "$secret_identities"
+if [ "$mode" = secrets ]; then exit 0; fi
+
+if [ "$kernel" = Darwin ]; then
+  # ロックした版の nix-darwin を含むシステムを、先に自分の権限でビルドする。
+  # ファイルを移すのはビルドが済んでから（移したままの時間を短くする）。
+  system=$(nix --extra-experimental-features "nix-command flakes" \
+    build --impure --no-link --print-out-paths "path:$config_dir#darwinConfigurations.default.system")
+  backup_conflicts
+  run_apply sudo env \
+    HOME=/var/root \
+    NIX_CONFIG_USER="$NIX_CONFIG_USER" \
+    NIX_CONFIG_HOME="$NIX_CONFIG_HOME" \
+    NIX_CONFIG_SYSTEM="$NIX_CONFIG_SYSTEM" \
+    "$system/sw/bin/darwin-rebuild" switch --impure --flake "$flake"
+  if [ "$apply_status" -ne 0 ]; then
+    exit_if_interrupted
+    die "darwin-rebuild が失敗しました。表示されたエラーを README の「switch が止まったとき」で確かめてください"
+  fi
+else
+  # 評価とビルドは利用者の権限で行い（環境変数がそのまま届く）、適用だけを sudo で行う。
+  nix --extra-experimental-features "nix-command flakes" \
+    build --impure --no-link "path:$config_dir#nixosConfigurations.default.config.system.build.toplevel"
+  backup_conflicts
+  run_apply nixos-rebuild switch --impure --sudo --flake "$flake"
+  case $apply_status in
+    0)
+      # 構成が前回と同じだと Home Manager のユニットは動き直さないので、移した場所に置かせる。
+      if [ -n "$backup_dir" ]; then
+        exit_if_interrupted
+        run_apply sudo systemctl restart "home-manager-$(systemd-escape -- "$user_name").service"
+        if [ "$apply_status" -ne 0 ]; then
+          exit_if_interrupted
+          die "Home Manager の適用に失敗しました。journalctl -u 'home-manager-*' で原因を確かめてください"
+        fi
+      fi
+      ;;
+    100)
+      # switch-to-configuration は、ブートローダーを更新した後、ファイルを置く前に「再起動が必要」として終わる。
+      printf '適用には再起動が必要です。ファイルはまだ置き換わっていません。\n'
+      put_back_moved_files ||
+        die "戻せなかったファイルがあります。表示された switch restore で戻してから再起動してください"
+      printf '再起動してから、もう一度 switch を実行してください。\n'
+      ;;
+    *)
+      exit_if_interrupted
+      die "nixos-rebuild が失敗しました。表示されたエラーを README の「switch が止まったとき」で確かめてください"
+      ;;
+  esac
+fi
+
+switch_completed=1
+# 適用が済むまで、削除された設定の古い復号先は保持する。再起動待ちではまだ消さない。
+if [ "$apply_status" -ne 100 ]; then
+  sh "$config_dir/scripts/sync-secrets.sh" prune "$env_dir" "$secret_state" "$secret_tools" "$secret_identities"
+fi
+if [ -s "$secret_state/.warnings" ]; then
+  printf '復号できなかった設定があります。YubiKeyを確認して switch secrets を実行してください。\n' >&2
+  cat "$secret_state/.warnings" >&2
+fi
+if [ -n "$backup_dir" ]; then
+  printf '置き換える前のファイルは %s にあります。元に戻すには %s restore %s を実行します。\n' \
+    "$backup_dir" "$0" "${backup_dir##*/}"
+fi
+exit_if_interrupted
