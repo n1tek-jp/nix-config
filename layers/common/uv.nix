@@ -1,5 +1,12 @@
 # uv: Python の処理系・パッケージ管理。uv tool install で入れたコマンドは ~/.local/bin に置かれる。
 {
+  backupTargets = [
+    "~/.local/bin/uv"
+    "~/.local/bin/uvx"
+    "~/.cargo/bin/uv"
+    "~/.cargo/bin/uvx"
+  ];
+
   home =
     { pkgs, ... }:
     {

@@ -15,7 +15,7 @@ let
       homeDirectory
       hostSystem
       ;
-    inherit (layers) envSecrets;
+    inherit (layers) envSecrets localValues;
   };
 in
 inputs.nix-darwin.lib.darwinSystem {

@@ -3,7 +3,7 @@
 #   sh tests/switch-backup.sh [シェル]      例: sh tests/switch-backup.sh /bin/dash
 # switch を一時ディレクトリに写し、HOME・一覧・uname・nix・sudo・darwin-rebuild・nixos-rebuild・systemctl・systemd-escape を
 # 差し替えて動かす。本物のホーム、/etc、Nix には触れない。
-# NixOS の経路は /etc/NIXOS がある Linux（使い捨てのコンテナなど）でだけ確かめ、それ以外では飛ばす。
+# NixOS の判定ファイルも一時ディレクトリへ差し替えるので、macOS でも両経路を検証する。
 # root では書き込めない場所の扱い（sudo）を確かめられないので、root 以外で動かす。
 # 確かめる式は check が eval するので、わざと単一引用符で書く（SC2016。式の中の変数を shellcheck は追えない: SC2034）。
 # バックアップの名前は switch が付けた ID なので ls で数える（SC2012）。誤りの例として ~ を文字のまま書く（SC2088）。
@@ -39,10 +39,11 @@ setup() {
   T=$base/$1
   os=$2
   mkdir -p "$T/cfg" "$T/home" "$T/bin" "$T/sys/sw/bin" "$T/etc" "$T/dotfiles/linkdir"
-  cp "$source_switch" "$T/cfg/switch"
+  sed "s|/etc/NIXOS|$T/NIXOS|g" "$source_switch" >"$T/cfg/switch"
+  touch "$T/NIXOS"
   mkdir "$T/cfg/scripts"
   cp "${source_switch%/*}/scripts/sync-secrets.sh" "$T/cfg/scripts/"
-  cat >"$T/cfg/backup-targets.txt" <<EOF
+  cat >"$T/cfg/targets" <<EOF
 # comment
 
 ~/.zshrc
@@ -75,7 +76,12 @@ EOF
   cat >"$T/bin/nix" <<EOF
 #!/bin/sh
 echo "\$*" >>"$T/nix.log"
-case " \$* " in *" build "*) echo "$T/sys" ;; esac
+case " \$* " in
+  *"switchConfig.secrets.keyType"*) echo yubikey ;;
+  *"switchConfig.secrets.identityFile"*) echo "$T/home/identities" ;;
+  *"switchConfig.backupTargets"*) [ ! -f "$T/cfg/targets" ] || cat "$T/cfg/targets" ;;
+  *" build "*) echo "$T/sys" ;;
+esac
 EOF
   # sudo: 呼ばれたことを記録し、書き込めない /etc の代わりの場所だけ一時的に開けて実行する
   cat >"$T/bin/sudo" <<EOF
@@ -242,9 +248,9 @@ check "sudo はホームの下に使わない" 'sudo_only_for_etc'
 echo "== D10 一覧の書き方の誤り: ビルドの前に止まり、何も移さない"
 for bad in "relative/path" "~/.zshrc # comment" "~/.zshrc "; do
   setup d10 darwin
-  printf '%s\n' "$bad" >>"$T/cfg/backup-targets.txt"
+  printf '%s\n' "$bad" >>"$T/cfg/targets"
   sw
-  check "誤り「${bad}」で止まる" '[ "$(rc)" != 0 ] && grep -q "error: .*backup-targets.txt" "$T/out"'
+  check "誤り「${bad}」で止まる" '[ "$(rc)" != 0 ] && grep -q "error: .*context backupTargets" "$T/out"'
   check "ビルドしない" '! grep -q build "$T/nix.log" 2>/dev/null'
   check "何も動かさない" 'originals_back && etc_back && [ "$(nbackups)" = 0 ]'
   chmod -R u+w "$T"
@@ -253,13 +259,13 @@ done
 
 echo "== D11 末尾の / と、改行の無い最終行"
 setup d11 darwin
-printf '~/.zshenv/\n~/.zshrc' >"$T/cfg/backup-targets.txt"
+printf '~/.zshenv/\n~/.zshrc' >"$T/cfg/targets"
 sw
 check "どちらも移す" '[ "$(rc)" = 0 ] && grep -qxF "$T/home/.zshenv" "$(backups)/$(latest)/manifest" && grep -qxF "$T/home/.zshrc" "$(backups)/$(latest)/manifest"'
 
 echo "== D12 最初の移動に失敗: 空のバックアップを残さない"
 setup d12 darwin
-printf '%s\n' "$T/etc/zshrc" >"$T/cfg/backup-targets.txt"
+printf '%s\n' "$T/etc/zshrc" >"$T/cfg/targets"
 : >"$T/sudo-refuse"
 sw
 check "rc!=0" '[ "$(rc)" != 0 ]'
@@ -331,12 +337,12 @@ check "元に戻る" 'originals_back && etc_back && [ "$(nbackups)" = 0 ]'
 
 echo "== D15 一覧が無い: 何も移さない"
 setup d15 darwin
-rm "$T/cfg/backup-targets.txt"
+rm "$T/cfg/targets"
 echo unchanged >"$T/mode"
 sw
 check "rc=0、バックアップ無し" '[ "$(rc)" = 0 ] && [ "$(nbackups)" = 0 ] && originals_back'
 
-if [ -e /etc/NIXOS ]; then
+if :; then
   echo "== N1 NixOS 成功: Home Manager のユニットを動かし直す"
   setup n1 nixos
   sw
@@ -379,8 +385,13 @@ if [ -e /etc/NIXOS ]; then
   : >"$T/systemctl-fail"
   sw
   check "rc!=0、元に戻る" '[ "$(rc)" != 0 ] && originals_back && [ "$(nbackups)" = 0 ]'
-else
-  echo "== NixOS の経路は飛ばした（/etc/NIXOS が無い）"
+  echo "== N7 NixOS 退避が無い場合も activation を実行する"
+  setup n7 nixos
+  rm "$T/cfg/targets"
+  echo unchanged >"$T/mode"
+  sw
+  check "rc=0、バックアップ無しで Home Manager を動かす" '[ "$(rc)" = 0 ] && [ "$(nbackups)" = 0 ] && grep -q "^restart home-manager-" "$T/systemctl.log"'
+
 fi
 
 printf '%s: %d passed, %d failed\n' "$shell_under_test" "$pass" "$fail"

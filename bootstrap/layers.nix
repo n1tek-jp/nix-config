@@ -3,6 +3,51 @@
 let
   layersDir = root + "/layers";
   envDir = layersDir + "/user/.env.d";
+  contextKeys = targets ++ [ "backupTargets" ];
+  homeDirectory = builtins.getEnv "NIX_CONFIG_HOME";
+  localEnvDir = layersDir + "/local/.env.d";
+  readLocal =
+    name: fallback:
+    let
+      file = localEnvDir + "/${name}.nix";
+    in
+    if builtins.pathExists file then import file else fallback;
+  localValues = readLocal "values" { };
+  secretSettings = readLocal "secrets" { };
+  secretKeyType = secretSettings.keyType or "yubikey";
+  identityFile =
+    secretSettings.identityFile or "${homeDirectory}/.config/sops/age/nix-config-yubikeys.txt";
+  secrets =
+    if
+      !builtins.isAttrs secretSettings
+      || lib.subtractLists [ "keyType" "identityFile" ] (builtins.attrNames secretSettings) != [ ]
+    then
+      throw "layers/local/.env.d/secrets.nix: keyType と identityFile の設定だけを書いてください"
+    else if
+      !builtins.elem secretKeyType [
+        "yubikey"
+        "age"
+      ]
+    then
+      throw "layers/local/.env.d/secrets.nix: keyType は yubikey か age にしてください"
+    else if secretKeyType == "age" && !(secretSettings ? identityFile) then
+      throw "layers/local/.env.d/secrets.nix: age を選ぶ場合は identityFile を指定してください"
+    else if
+      !builtins.isString identityFile
+      || !(lib.hasPrefix "/" identityFile || lib.hasPrefix "~/" identityFile)
+      || lib.hasInfix "\n" identityFile
+    then
+      throw "layers/local/.env.d/secrets.nix: identityFile は絶対パスか ~/ で始まる文字列にしてください（鍵本体は書かない）"
+    else
+      {
+        keyType = secretKeyType;
+        identityFile =
+          if lib.hasPrefix "~/" identityFile then
+            "${homeDirectory}/${lib.removePrefix "~/" identityFile}"
+          else
+            identityFile;
+      };
+
   targets = [
     "home"
     "system"
@@ -17,7 +62,8 @@ let
   plaintextFiles = builtins.attrNames (
     lib.filterAttrs (
       name: type:
-      type == "regular" && lib.hasSuffix ".nix" name
+      type != "regular"
+      || !(lib.hasSuffix ".sops" name || lib.hasSuffix ".example" name || name == ".sops.yaml")
     ) envEntries
   );
   secretNames = map (name: lib.removeSuffix ".sops" name) (
@@ -31,9 +77,7 @@ let
     if plaintextFiles != [ ] then
       throw "layers/user/.env.d に平文の設定があります。README の『自分の情報を登録する』に従い、nix-config 全体の外へ退避してください"
     else
-      lib.genAttrs secretNames (
-        name: "${builtins.getEnv "NIX_CONFIG_HOME"}/.local/state/nix-config/secrets/${name}"
-      );
+      lib.genAttrs secretNames (name: "${homeDirectory}/.local/state/nix-config/secrets/${name}");
 
   organizationLayers =
     let
@@ -106,19 +150,36 @@ let
       raw = import path;
       extraArgs = lib.subtractLists [ "layer" ] (builtins.attrNames (builtins.functionArgs raw));
       value = if builtins.isFunction raw then raw { inherit layer; } else raw;
-      unknown = lib.subtractLists targets (builtins.attrNames value);
+      unknown = lib.subtractLists contextKeys (builtins.attrNames value);
+      backups = value.backupTargets or [ ];
     in
     if builtins.isFunction raw && extraArgs != [ ] then
       throw "${toString path}: コンテキストの関数が受け取れるのは layer だけです。${lib.concatStringsSep ", " extraArgs} は home = { pkgs, ... }: { ... }; のように各適用先のモジュールで受け取ってください"
     else if !builtins.isAttrs value then
       throw "${toString path}: コンテキストは attrset か、{ layer, ... } を受け取る関数にしてください"
     else if unknown != [ ] then
-      throw "${toString path}: 未知のキー ${lib.concatStringsSep ", " unknown}（使えるのは ${lib.concatStringsSep ", " targets}）"
+      throw "${toString path}: 未知のキー ${lib.concatStringsSep ", " unknown}（使えるのは ${lib.concatStringsSep ", " contextKeys}）"
+    else if
+      !(
+        builtins.isList backups
+        && builtins.all (
+          target:
+          builtins.isString target
+          && !(lib.hasInfix "\n" target)
+          && !(lib.hasInfix "\r" target)
+          && (lib.hasPrefix "/" target || lib.hasPrefix "~/" target)
+        ) backups
+      )
+    then
+      throw "${toString path}: backupTargets は絶対パスか ~/ で始まる文字列リストにしてください（改行は使えません）"
     else
-      lib.mapAttrs (target: module: {
+      {
+        backupTargets = backups;
+      }
+      // lib.mapAttrs (target: module: {
         _file = "${toString path}#${target}";
         imports = [ module ];
-      }) value;
+      }) (builtins.removeAttrs value [ "backupTargets" ]);
 
   # 弱い層から順に読み込む。ただし、リスト型の設定（シェルの初期化行など）が出力される順序は
   # モジュールシステムの実装に依存する。順序が意味を持つ箇所では lib.mkOrder で明示する。
@@ -129,6 +190,12 @@ let
     target: lib.concatMap (context: lib.optional (context ? ${target}) context.${target}) applied;
 in
 {
-  inherit priorities envSecrets;
+  inherit priorities envSecrets secrets;
+  localValues =
+    if builtins.isAttrs localValues then
+      localValues
+    else
+      throw "layers/local/.env.d/values.nix: 属性集合を書いてください";
+  backupTargets = lib.unique (lib.concatMap (context: context.backupTargets) applied);
 }
 // lib.genAttrs targets modulesFor

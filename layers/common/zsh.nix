@@ -1,5 +1,14 @@
 # zsh: ログインシェルと補完。キーバインドやエイリアスなどの好みは user レイヤーに置く。
 {
+  backupTargets = [
+    "~/.zshrc"
+    "~/.zshenv"
+    "~/.zprofile"
+    "/etc/zshrc"
+    "/etc/zshenv"
+    "/etc/zprofile"
+  ];
+
   home =
     { pkgs, ... }:
     {

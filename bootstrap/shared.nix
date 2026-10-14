@@ -1,5 +1,12 @@
 # macOS と NixOS の両方で使う土台。形はコンテキストと同じ（system / home）。
 {
+  # nix-darwin の土台が置き換えるファイル（macOS のみ switch が集約する）。
+  backupTargets = [
+    "/etc/bashrc"
+    "/etc/nix/nix.conf"
+    "/etc/pam.d/sudo_local"
+  ];
+
   # unfree のパッケージは、使うコンテキストが system.nixpkgs.config.allowUnfreePackages に名前を足して許可する。
   system = {
     nix.settings.experimental-features = [
@@ -18,6 +25,8 @@
   home =
     { userName, homeDirectory, ... }:
     {
+      imports = [ ./home-options.nix ];
+
       home = {
         username = userName;
         inherit homeDirectory;

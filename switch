@@ -1,7 +1,7 @@
 #!/bin/sh
 # この設定を端末へ適用する。初回の導入と、設定を変えた後の反映の両方に使う。
 #   switch                設定を適用する（macOS で Nix が無ければ公式インストーラーで入れる）。
-#                         backup-targets.txt にあるファイルのうち Nix が管理していないものは、
+#                         各コンテキストの backupTargets にあるファイルのうち Nix が管理していないものは、
 #                         ~/.local/state/nix-config/backups/<ID>/ へ移してから適用する。
 #                         適用が完了しなければ、移したまま空いている場所に元のファイルを戻す
 #   switch update         flake.lock を更新する（適用はしない。更新前の lock を flake.lock.backup に残す）
@@ -23,7 +23,7 @@ nix_daemon_profile=/nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
 # 置き換える前にバックアップするファイルの一覧と、バックアップの置き場所。
 # バックアップをこのディレクトリの中に置かないのは、switch がこのディレクトリを丸ごと
 # Nix ストア（端末の誰でも読める）にコピーするため。
-backup_targets="$config_dir/backup-targets.txt"
+backup_targets="context backupTargets"
 backup_root="$home_directory/.local/state/nix-config/backups"
 
 die() {
@@ -129,11 +129,10 @@ as_owner_of() {
   fi
 }
 
-# backup-targets.txt を読み、1行に1つの絶対パスにして出力する。
+# 評価済みの backupTargets を、1行に1つの絶対パスにして出力する。
 # 何も無い行と、行頭が # の行は飛ばす。先頭の ~/ はホームに置き換え、末尾の / は取り除く。
 # 行の途中のコメント、行末の空白、空白だけの行は、パスの一部と区別できないので誤りとする。
 read_backup_targets() {
-  [ -f "$backup_targets" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
     case $line in
       '' | '#'*) continue ;;
@@ -151,7 +150,9 @@ read_backup_targets() {
         return 1
         ;;
     esac
-  done <"$backup_targets"
+  done <<BACKUP_TARGETS
+$declared_targets
+BACKUP_TARGETS
 }
 
 # 一覧のファイルのうち、存在していて Nix が管理していないものをバックアップへ移す。
@@ -319,15 +320,11 @@ if [ "$mode" = restore ]; then
   exit 0
 fi
 
-# 一覧の書き方の誤りは、時間のかかるビルドの前に知らせる。
-if [ "$mode" = switch ]; then
-  targets=$(read_backup_targets) || exit 1
-fi
-
 # path: は gitignore に関係なくコピーするので、評価の前に平文を拒否する。
 env_dir="$config_dir/layers/user/.env.d"
 for entry in "$env_dir"/* "$env_dir"/.[!.]*; do
-  [ -f "$entry" ] || continue
+  [ -e "$entry" ] || [ -L "$entry" ] || continue
+  [ -f "$entry" ] && [ ! -L "$entry" ] || die "layers/user/.env.d は通常ファイルだけを置いてください"
   case ${entry##*/} in *.sops|*.example|.sops.yaml) ;;
     *) die "layers/user/.env.d に平文の設定があります。READMEの『自分の情報を登録する』に従ってください" ;;
   esac
@@ -354,7 +351,16 @@ trap 'exit 141' PIPE
 trap 'exit 143' TERM
 
 secret_state="$home_directory/.local/state/nix-config/secrets"
-secret_identities="$home_directory/.config/sops/age/nix-config-yubikeys.txt"
+# 値は公開設定だけ。シェルコードとして eval せず、文字列として読む。
+secret_key_type=$(nix --extra-experimental-features "nix-command flakes" \
+  eval --impure --raw "path:$config_dir#switchConfig.secrets.keyType")
+secret_identities=$(nix --extra-experimental-features "nix-command flakes" \
+  eval --impure --raw "path:$config_dir#switchConfig.secrets.identityFile")
+if [ "$mode" = switch ]; then
+  declared_targets=$(nix --extra-experimental-features "nix-command flakes" \
+    eval --impure --raw --apply 'paths: builtins.concatStringsSep "\n" paths' "path:$config_dir#switchConfig.backupTargets")
+  targets=$(read_backup_targets) || exit 1
+fi
 secret_tools=""
 for cipher in "$env_dir"/*.sops; do
   [ -f "$cipher" ] || continue
@@ -366,7 +372,7 @@ for cipher in "$env_dir"/*.sops; do
     break
   fi
 done
-sh "$config_dir/scripts/sync-secrets.sh" sync "$env_dir" "$secret_state" "$secret_tools" "$secret_identities"
+sh "$config_dir/scripts/sync-secrets.sh" sync "$env_dir" "$secret_state" "$secret_tools" "$secret_identities" "$secret_key_type"
 if [ "$mode" = secrets ]; then exit 0; fi
 
 if [ "$kernel" = Darwin ]; then
@@ -393,14 +399,12 @@ else
   run_apply nixos-rebuild switch --impure --sudo --flake "$flake"
   case $apply_status in
     0)
-      # 構成が前回と同じだと Home Manager のユニットは動き直さないので、移した場所に置かせる。
-      if [ -n "$backup_dir" ]; then
+      # 構成が同じでも、復号先や外部ツールの状態は変わる。利用者の activation を毎回実行する。
+      exit_if_interrupted
+      run_apply sudo systemctl restart "home-manager-$(systemd-escape -- "$user_name").service"
+      if [ "$apply_status" -ne 0 ]; then
         exit_if_interrupted
-        run_apply sudo systemctl restart "home-manager-$(systemd-escape -- "$user_name").service"
-        if [ "$apply_status" -ne 0 ]; then
-          exit_if_interrupted
-          die "Home Manager の適用に失敗しました。journalctl -u 'home-manager-*' で原因を確かめてください"
-        fi
+        die "Home Manager の適用に失敗しました。journalctl -u 'home-manager-*' で原因を確かめてください"
       fi
       ;;
     100)
@@ -420,10 +424,10 @@ fi
 switch_completed=1
 # 適用が済むまで、削除された設定の古い復号先は保持する。再起動待ちではまだ消さない。
 if [ "$apply_status" -ne 100 ]; then
-  sh "$config_dir/scripts/sync-secrets.sh" prune "$env_dir" "$secret_state" "$secret_tools" "$secret_identities"
+  sh "$config_dir/scripts/sync-secrets.sh" prune "$env_dir" "$secret_state" "$secret_tools" "$secret_identities" "$secret_key_type"
 fi
 if [ -s "$secret_state/.warnings" ]; then
-  printf '復号できなかった設定があります。YubiKeyを確認して switch secrets を実行してください。\n' >&2
+  printf '復号できなかった設定があります。鍵の選択と復号の警告を確認して switch secrets を実行してください。\n' >&2
   cat "$secret_state/.warnings" >&2
 fi
 if [ -n "$backup_dir" ]; then

@@ -106,8 +106,8 @@ class Secrets(unittest.TestCase):
         r=subprocess.run([SOPS,'--config','/dev/null','encrypt','--input-type','binary','--output-type','binary','--age',recipient or self.r1,'/dev/stdin'],input=content,env=self.env,capture_output=True)
         self.assertEqual(r.returncode,0,r.stderr.decode())
         (self.envdir/(name+'.sops')).write_bytes(r.stdout)
-    def sync(self,tty=True,action='sync'):
-        cmd=['/bin/sh',str(HELPER),action,str(self.envdir),str(self.state),str(self.tools),str(self.ids)]
+    def sync(self,tty=True,action='sync',key_type='yubikey',identities=None):
+        cmd=['/bin/sh',str(HELPER),action,str(self.envdir),str(self.state),str(self.tools),str(identities or self.ids),key_type]
         if not tty:
             return subprocess.run(cmd,env=self.env,capture_output=True,start_new_session=True)
         pid,fd=pty.fork()
@@ -207,6 +207,71 @@ class Secrets(unittest.TestCase):
         self.ids.write_text('AGE-SECRET-KEY-DISPOSABLE-INVALID\n'+self.ids.read_text())
         self.encrypt('git',b'ok'); self.sync(); self.assertEqual((self.state/'git').read_bytes(),b'ok')
         self.assertClean()
+
+    def software_key(self, name='software'):
+        path = self.root/name
+        result = subprocess.run([shutil.which('age-keygen'), '-o', str(path)], capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        recipient = subprocess.check_output([shutil.which('age-keygen'), '-y', str(path)]).decode().strip()
+        return path, recipient
+    def test_software_key_without_terminal(self):
+        key, recipient = self.software_key()
+        self.encrypt('api', b'software-secret', recipient)
+        self.assertEqual(self.sync(tty=False,key_type='age',identities=key).returncode,0)
+        self.assertEqual((self.state/'api').read_bytes(),b'software-secret')
+        self.assertEqual((self.state/'api').stat().st_mode & 0o777,0o400)
+        self.assertFalse(self.calls.exists())
+        self.assertClean()
+    def test_software_key_is_not_implicitly_selected(self):
+        key, recipient = self.software_key()
+        self.encrypt('api',b'implicit',recipient)
+        self.env['SOPS_AGE_KEY_FILE']=str(key)
+        self.env['SOPS_AGE_KEY']=key.read_text()
+        default=self.home/'config/sops/age/keys.txt'
+        default.parent.mkdir(parents=True); default.write_text(key.read_text())
+        self.sync()
+        self.assertFalse((self.state/'api').exists())
+        self.assertFalse(self.calls.exists())
+    def test_software_selection_ignores_other_age_keys(self):
+        key, recipient = self.software_key()
+        wrong, _ = self.software_key('wrong')
+        self.encrypt('api',b'implicit',recipient)
+        self.env['SOPS_AGE_KEY']=key.read_text()
+        self.env['SOPS_AGE_KEY_FILE']=str(key)
+        command=self.root/'key-command'
+        command.write_text('#!/bin/sh\ntouch '+str(self.root/'unexpected-command')+'\ncat '+str(key)+'\n')
+        command.chmod(0o700)
+        self.env['SOPS_AGE_KEY_CMD']=str(command)
+        default=self.home/'config/sops/age/keys.txt'
+        default.parent.mkdir(parents=True); default.write_text(key.read_text())
+        self.sync(tty=False,key_type='age',identities=wrong)
+        self.assertFalse((self.state/'api').exists())
+        self.assertClean()
+        self.assertFalse((self.root/'unexpected-command').exists())
+    def test_software_selection_ignores_home_ssh_key(self):
+        ssh=self.home/'.ssh/id_ed25519'; ssh.parent.mkdir()
+        subprocess.run(['/usr/bin/ssh-keygen','-q','-t','ed25519','-N','','-f',str(ssh)],check=True)
+        key, _ = self.software_key()
+        self.encrypt('api',b'ssh-secret',Path(str(ssh)+'.pub').read_text().strip())
+        self.env['SOPS_AGE_SSH_PRIVATE_KEY_FILE']=str(ssh)
+        self.sync(tty=False,key_type='age',identities=key)
+        self.assertFalse((self.state/'api').exists())
+    def test_software_failure_preserves_cache_but_allows_other_files(self):
+        key, recipient = self.software_key()
+        _, wrong_recipient = self.software_key('wrong')
+        self.encrypt('api',b'old',recipient)
+        self.sync(tty=False,key_type='age',identities=key)
+        self.encrypt('api',b'new',wrong_recipient)
+        self.encrypt('later',b'valid',recipient)
+        self.sync(tty=False,key_type='age',identities=key)
+        self.assertEqual((self.state/'api').read_bytes(),b'old')
+        self.assertEqual((self.state/'later').read_bytes(),b'valid')
+        self.assertClean()
+    def test_software_selection_rejects_plugin_identity(self):
+        self.encrypt('api',b'ok')
+        self.sync(tty=False,key_type='age')
+        self.assertFalse((self.state/'api').exists())
+        self.assertFalse(self.calls.exists())
 
 if __name__=='__main__':
     if SOPS is None: sys.exit('sopsが必要です')

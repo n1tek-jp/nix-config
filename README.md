@@ -40,7 +40,7 @@ macOS と NixOS の開発環境（パッケージ、シェル、エディタ、�
 
 4. 終わったら新しいターミナルを開く
 
-既にある設定ファイルやコマンド（`~/.zshrc` など、[backup-targets.txt](backup-targets.txt) に書いたもの）は、ビルドが済んでから `~/.local/state/nix-config/backups/<ID>/` に移して置き換える（ID はファイルを移した日時。終わりに表示される）。途中で失敗したり Ctrl-C で止めたりしたら、移したまま空いている場所には元のファイルが自動で戻る。Nix が置き換え終えたものは置き換わったまま残り、戻すためのコマンド（`switch restore <ID>`）が表示される。
+既にある設定ファイルやコマンド（`~/.zshrc` など、各コンテキストの `backupTargets` に書いたもの）は、ビルドが済んでから `~/.local/state/nix-config/backups/<ID>/` に移して置き換える（ID はファイルを移した日時。終わりに表示される）。途中で失敗したり Ctrl-C で止めたりしたら、移したまま空いている場所には元のファイルが自動で戻る。Nix が置き換え終えたものは置き換わったまま残り、戻すためのコマンド（`switch restore <ID>`）が表示される。
 
 macOS で sudo に Touch ID を使っている（`/etc/pam.d/sudo_local` に書いた）場合や、`/etc/nix/nix.conf` を編集している場合は、これらも移されて効かなくなる。使い続けるなら、先に `layers/user/` のファイルの `darwin` に `security.pam.services.sudo_local.touchIdAuth = true;` や `nix.settings` を書いてから `switch` する。
 
@@ -108,6 +108,146 @@ YubiKeyを使う場合、`layers/user/` のコンテキストに `pkgs.age-plugi
 ~/nix-config/switch secrets
 ```
 
+## ソフトウェア age 鍵を選ぶ
+
+既定は YubiKey。YubiKey を使わない端末では、初回の `switch` で age を入れた後、リポジトリの外に鍵を作る。
+
+```sh
+mkdir -p -m 700 ~/.config/sops/age
+(umask 077; age-keygen -o ~/.config/sops/age/nix-config-software.txt)
+```
+
+`layers/local/.env.d/secrets.nix` に、鍵の種類とパスを**文字列**で指定する。鍵本体を Nix に書いたり、リポジトリ内に置いたりしない。この設定は Git 管理外だが、Nix store にコピーされる。
+
+```nix
+{
+  keyType = "age";
+  identityFile = "~/.config/sops/age/nix-config-software.txt";
+}
+```
+
+`age-keygen -y ~/.config/sops/age/nix-config-software.txt` で公開鍵を取得し、暗号文の受信者にも登録する。既存の YubiKey 用暗号文は、ソフトウェア鍵を選ぶだけでは読めない。既存の鍵で復号できる端末で `.sops.yaml` の受信者を変更し、`sops updatekeys <名前>.sops` を行う。
+
+編集時は選んだ鍵を明示する。
+
+```sh
+export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/nix-config-software.txt"
+```
+
+`switch` と `switch secrets` は、この local 設定で選んだ鍵だけを使う。シェルの `SOPS_AGE_KEY*`、標準の `keys.txt`、SSH 鍵は自動で拾わない。ソフトウェア鍵なら対話端末・PIN・タッチは不要。設定を削除すれば既定の YubiKey に戻る。YubiKey の識別子パスも `keyType = "yubikey"; identityFile = "~/…";` で変更できる。
+
+## 秘密を環境変数やテンプレートへ渡す
+
+秘密は従来と同じ binary 形式の `.sops` に保存する。Nix に渡る `envSecrets.<名前>` は復号先のパスだけであり、`builtins.readFile` や `import` で平文を読むことはしない。
+
+### zsh の環境変数
+
+例えば `api.sops` の復号後の内容を次のシェル代入形式にする。平文の編集用ファイルはリポジトリ外へ置く。
+
+```sh
+API_TOKEN='your-token'
+SERVICE_URL='https://example.com'
+```
+
+利用するコンテキストに次を加える。
+
+```nix
+{
+  home.nixConfig.secretEnvFiles = [ "api" ];
+}
+```
+
+新しい zsh の対話シェルで復号先を `source` し、変数を export する。ファイルが未復号なら読み込みを省く。設定順に読み、後のファイルが同じ変数を上書きする。`source` はシェルコードを実行するため、内容は信頼できる代入だけにする。これは dotenv パーサーではなく、空白・引用符・`$` は zsh の文法に従う。`switch secrets` の後は新しいシェルを開く。非対話プログラムには、この対話シェルから起動するか、対応する実行時処理で明示的に読み込ませる。
+
+### ストア外のテンプレート
+
+例えば `tool.sops` の平文を JSON オブジェクト `{"token":"your-token"}` にする。コンテキストの `home` に次を書く。
+
+```nix
+{
+  home.nixConfig.secretTemplates.tool = {
+    target = ".config/tool/config.json";
+    content = ''
+      { "token": @TOKEN@, "region": "ap-northeast-1" }
+    '';
+    values.TOKEN = { secret = "tool"; key = "token"; };
+  };
+}
+```
+
+`switch` の Home Manager activation で JSON の `token` だけを読み、`@TOKEN@` を JSON エスケープして埋め込む。プレースホルダーの周囲に引用符は書かない。完成後の JSON 構文も確認する。`key` を省略すると、復号ファイル全体を文字列として使う（末尾の改行も保持する）。`format = "text";` なら文字列をそのまま埋め込める。プレースホルダー名は英数字と `_`、先頭は英字か `_` にする。
+
+生成先はホーム内の相対パスに限定し、リンクやホーム外を指す親ディレクトリは拒否する。新規ディレクトリは0700、ファイルは0600で、一時ファイルを rename して更新する。外部ツールは生成後の通常ファイルを編集できるが、次の `switch` はテンプレートで上書きする。秘密が未復号なら以前のファイルを保持し、構文・キーの誤りでは以前のファイルを保持して適用を失敗させる。秘密値やエラーの詳細はログに出さない。
+
+生成先を `home.file` や `xdg.configFile` でも管理しない。オプションや生成先を削除したときのファイル削除は手動で行う。`switch secrets` は復号だけなので、テンプレートの再生成には `switch` を実行する。
+
+## 秘密ではない個人の値
+
+`layers/local/.env.d/values.nix` に公開してよい値を置く。ここは Git 管理外だが、値は Nix store に入り、端末のほかのユーザーも読める。
+
+```nix
+{ userName = "example"; }
+```
+
+各適用先のモジュールで `localValues` を受け取れる。
+
+```nix
+{ layer, ... }:
+{
+  home = { localValues, ... }: {
+    home.sessionVariables.TOOL_USER = layer.override localValues.userName;
+  };
+}
+```
+
+API キーや認証情報はここへ書かず `.sops` に保存する。`layers/user/.env.d` は暗号文・公開鍵設定・ひな形専用のままにする。
+
+## コンテキストの適用後処理と退避対象
+
+書き換え可能なファイルのコピー、CLI による設定、ランタイムの導入などは、コンテキストの `home.activation` に書く。
+
+```nix
+{
+  home = { lib, pkgs, ... }: {
+    home.activation.toolConfig = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+      run ${pkgs.coreutils}/bin/install -d -m 700 "$HOME/.kiro"
+      # 公開の初期ファイルをコピーする場合も run と絶対パスのコマンドを使う。
+    '';
+  };
+}
+```
+
+macOS と NixOS の両方で対象ユーザーの権限・HOME で実行する。PATH は Home Manager が用意する基本ツールに限定されるため、`${pkgs.<パッケージ>}/bin/<コマンド>` を使うか `home.extraActivationPath = [ pkgs.<パッケージ> ];` を指定する。zsh の初期化、環境変数、asdf の shim、対話端末は前提にしない。ログイン・PIN 入力などは事前に済ませ、処理は非対話で完了させる。
+
+変更する処理は `writeBoundary` の後に置き、`run` を使って dry-run に従う。テンプレート生成を待つなら `entryAfter [ "nixConfigSecretTemplates" ]` にする。NixOS では構成が同じでも `switch` 成功後に Home Manager を再実行する。構成変更時には同じ処理が複数回動くことがあり、起動時にも動くため、繰り返しても結果が変わらない処理にする。システム全体の適用が終わった後の対話処理を保証するフックではない。
+
+退避対象は、置き換えるファイルを所有するコンテキストに宣言する。
+
+```nix
+{
+  backupTargets = [ "~/.zshrc" ];
+  home.programs.zsh.enable = true;
+}
+```
+
+読み込まれるコンテキストの対象だけを集約し、重複を除いて `switch` へ渡す。絶対パスまたは `~/` で始まる文字列を使い、改行・末尾の空白・行内コメントを入れない。実ディレクトリは対象外。外部ツールが普段書き換えるファイルは宣言しない。`/etc` の共通基盤の対象は `bootstrap/shared.nix` が持つ。
+
+旧 `backup-targets.txt` は廃止した。個人用リポジトリで追加していた asdf・rustup・dnsmasq・SMB などの対象は、対応するコンテキストの `backupTargets` へ移す。
+
+リポジトリのルートは `config.nixConfig.reposRootDir` で評価時に参照できる。既定は `${homeDirectory}/repos`。変更するコンテキストでは `layer.override` を使う。
+
+```nix
+{ layer, ... }:
+{
+  home = { config, ... }: {
+    nixConfig.reposRootDir = layer.override "/workspace";
+    home.sessionVariables.TOOL_ROOT = "${config.nixConfig.reposRootDir}/some-tool";
+  };
+}
+```
+
+`REPOS_ROOT_DIR` も同じ値から出力される。
+
 ## GitHub にログインする
 
 github.com への git の操作（https）は、GitHub CLI（gh）のトークンで認証する。キーチェーンを使わないよう、トークンをファイル（`~/.config/gh/hosts.yml`。自分だけが読める）に置く形でログインする。初回の `switch` の後に1回行う。
@@ -169,13 +309,13 @@ Git で管理している場合は、`git restore flake.lock`（コミット前�
 | 表示 | 対処 |
 | --- | --- |
 | `layers/user/.env.d に平文の設定があります` | 表示された平文をnix-config全体の外へ移す。[自分の情報を登録する](#自分の情報を登録する)に従ってsopsで登録し、再実行する |
-| `Unexpected files in /etc, aborting activation` | 表示されたファイルを [backup-targets.txt](backup-targets.txt) に足して再実行する（`switch` がバックアップしてから置き換える）。表示されたものがディレクトリなら、中身を確かめて手で退避する |
-| `Existing file '…' would be clobbered`（後ろに `by backing up` が無い） | 表示されたパスを [backup-targets.txt](backup-targets.txt) に足して再実行する（`switch` がバックアップしてから置き換える） |
+| `Unexpected files in /etc, aborting activation` | 表示されたファイルを対応するコンテキストの `backupTargets` に足して再実行する（`switch` がバックアップしてから置き換える）。表示されたものがディレクトリなら、中身を確かめて手で退避する |
+| `Existing file '…' would be clobbered`（後ろに `by backing up` が無い） | 表示されたパスを対応するコンテキストの `backupTargets` に足して再実行する（`switch` がバックアップしてから置き換える） |
 | `would be clobbered by backing up` | 前回の退避ファイル（`….before-nix-config`）が残っている。中身を確かめて消してから再実行する |
 | `別のファイルがあるため戻しません` | 表示されたファイルの中身を確かめ、要らなければ消してから `switch restore <ID>` を再実行する |
 | `戻せませんでした`、`Nix のリンクを外せませんでした`、`戻せなかったファイルがあります` | 表示されたバックアップのパスにファイルが残っている。`sudo` のパスワードなどを確かめてから、表示された `switch restore <ID>` を実行する |
-| `backup-targets.txt: 行の途中のコメント、行末の空白、空白だけの行は書けません`、`絶対パスか ~/ で始まるパスを書いてください` | `backup-targets.txt` の表示された行を直す（コメントは行頭の `#` だけ） |
-| `Home Manager の適用に失敗しました`、`the following units failed: home-manager-…`（NixOS） | `journalctl -u 'home-manager-*'` で原因を確かめる。`would be clobbered` なら、表示されたパスを `backup-targets.txt` に足して再実行する |
+| `context backupTargets: …`、`backupTargets は絶対パスか ~/ …` | 対応するコンテキストの `backupTargets` を直す。各要素を絶対パスか `~/` で始まる文字列にし、改行・行末の空白を入れない |
+| `Home Manager の適用に失敗しました`、`the following units failed: home-manager-…`（NixOS） | `journalctl -u 'home-manager-*'` で原因を確かめる。`would be clobbered` なら、表示されたパスを対応するコンテキストの `backupTargets` に足して再実行する |
 | `has conflicting definition values` | 複数のレイヤーが同じ項目に違う値を書いている。その値を書くすべてのレイヤーで `layer.override` で包む（[設定を変える](#設定を変える)）。エラーが勧める `lib.mkForce` は使わない |
 | `permission denied when trying to update apps, aborting activation` | システム設定 > プライバシーとセキュリティ > アプリ管理で、`switch` を実行したターミナルアプリを許可してから再実行する |
 | `permission denied when trying to update apps over SSH, aborting activation` | Mac の画面上で開いたターミナルから実行する |

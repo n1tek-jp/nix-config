@@ -1,12 +1,14 @@
 #!/bin/sh
 # sops binary の設定ファイルを利用者の権限で復号する。秘密は出力にも Nix 評価にも渡さない。
-# 第1引数 sync|prune、第2引数 .env.d、第3引数保存先、第4引数ツール、第5引数YubiKey識別子。
+# 第1引数 sync|prune、第2引数 .env.d、第3引数保存先、第4引数ツール、第5引数識別子、第6引数yubikey|age（既定yubikey）。
 set -eu
 action=$1
 env_dir=$2
 state_dir=$3
 tools=$4
 identities=$5
+key_type=${6:-yubikey}
+case $key_type in yubikey|age) ;; *) echo 'error: 鍵の種類は yubikey か age にしてください' >&2; exit 2;; esac
 umask 077
 mkdir -p "$state_dir"
 [ ! -L "$state_dir" ] || { echo 'error: 秘密の保存先がシンボリックリンクです' >&2; exit 1; }
@@ -45,7 +47,7 @@ for cipher in "$env_dir"/*.sops; do
   case $name in ''|*[!a-zA-Z0-9_-]*) echo 'error: .sops の名前は英数字、_、-にしてください' >&2; exit 1;; esac
 done
 tmp=$(mktemp -d "$state_dir/.work.XXXXXX")
-mkdir "$tmp/config"
+mkdir "$tmp/config" "$tmp/home"
 : >"$state_dir/.warnings"
 warn() {
   printf 'warning: %s: %s。前回の復号結果があれば保持します。\n' "$name" "$1" >&2
@@ -68,45 +70,65 @@ for cipher in "$env_dir"/*.sops; do
   # 自動検出のソフトウェア鍵や別の .sops.yaml を使わせない。filestatus は鍵を使用しない。
   if ! status=$(env -u SOPS_AGE_KEY -u SOPS_AGE_KEY_CMD -u SOPS_AGE_SSH_PRIVATE_KEY_FILE \
     -u SOPS_AGE_SSH_PRIVATE_KEY_CMD -u SOPS_AGE_RECIPIENTS \
-    XDG_CONFIG_HOME="$tmp/config" SOPS_AGE_KEY_FILE="$tmp/selected" \
+    HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" SOPS_AGE_KEY_FILE="$tmp/selected" \
     "$tools/bin/sops" --config /dev/null filestatus --input-type binary "$tmp/cipher" 2>/dev/null) ||
     [ "$status" != '{"encrypted":true}' ]; then
     warn 'sopsのbinary暗号文として読めません'; continue
   fi
   if [ "$ready" = 0 ]; then
-    if ! ( : </dev/tty ) 2>/dev/null; then warn '対話端末がないため復号できません'; continue; fi
-    if [ ! -r "$identities" ]; then warn 'YubiKey識別子がありません。READMEの手順で登録してください'; continue; fi
-    # --list は公開情報だけ。失敗しても、途中まで取得できた公開鍵を利用する。
-    "$tools/bin/age-plugin-yubikey" --list >"$tmp/connected" 2>/dev/null || :
-    # 登録順で、挿している1本の1スロットだけを選ぶ。ソフトウェア秘密鍵は読み込まない。
-    awk '
-      NR == FNR { if ($0 ~ /^age1yubikey1/) connected[$0]=1; next }
-      /^#/ && /Recipient:/ { recipient=$NF }
-      /^AGE-PLUGIN-YUBIKEY-/ && connected[recipient] { print; exit }
-    ' "$tmp/connected" "$identities" >"$tmp/selected"
-    if [ ! -s "$tmp/selected" ]; then warn '登録したYubiKeyが接続されていません'; continue; fi
-    awk '
-      NR == FNR { if ($0 ~ /^age1yubikey1/) connected[$0]=1; next }
-      /^#/ && /Recipient:/ { recipient=$NF }
-      /^AGE-PLUGIN-YUBIKEY-/ && connected[recipient] { print recipient; exit }
-    ' "$tmp/connected" "$identities" >"$tmp/recipient"
-    tty_state=$(stty -g </dev/tty)
-    ready=1
-    printf 'YubiKeyで復号します。PINを求められたら入力し、LEDが点滅したらタッチしてください。\n'
+    if [ "$key_type" = age ]; then
+      if [ ! -r "$identities" ]; then warn '指定したage鍵が読めません'; continue; fi
+      # plugin・SSH鍵は認めず、選択したソフトウェアage鍵だけを渡す。
+      if ! awk '
+        /^#/ || /^[[:space:]]*$/ { next }
+        /^AGE-SECRET-KEY-[A-Z0-9]+$/ { count++; next }
+        { bad=1 }
+        END { exit (bad || !count) }
+      ' "$identities"; then warn 'ソフトウェアage鍵の形式ではありません'; continue; fi
+      cp -- "$identities" "$tmp/selected"
+      ready=1
+    else
+      if ! ( : </dev/tty ) 2>/dev/null; then warn '対話端末がないため復号できません'; continue; fi
+      if [ ! -r "$identities" ]; then warn 'YubiKey識別子がありません。READMEの手順で登録してください'; continue; fi
+      # --list は公開情報だけ。失敗しても、途中まで取得できた公開鍵を利用する。
+      "$tools/bin/age-plugin-yubikey" --list >"$tmp/connected" 2>/dev/null || :
+      # 登録順で、挿している1本の1スロットだけを選ぶ。ソフトウェア秘密鍵は読み込まない。
+      awk '
+        NR == FNR { if ($0 ~ /^age1yubikey1/) connected[$0]=1; next }
+        /^#/ && /Recipient:/ { recipient=$NF }
+        /^AGE-PLUGIN-YUBIKEY-/ && connected[recipient] { print; exit }
+      ' "$tmp/connected" "$identities" >"$tmp/selected"
+      if [ ! -s "$tmp/selected" ]; then warn '登録したYubiKeyが接続されていません'; continue; fi
+      awk '
+        NR == FNR { if ($0 ~ /^age1yubikey1/) connected[$0]=1; next }
+        /^#/ && /Recipient:/ { recipient=$NF }
+        /^AGE-PLUGIN-YUBIKEY-/ && connected[recipient] { print recipient; exit }
+      ' "$tmp/connected" "$identities" >"$tmp/recipient"
+      tty_state=$(stty -g </dev/tty)
+      ready=1
+      printf 'YubiKeyで復号します。PINを求められたら入力し、LEDが点滅したらタッチしてください。\n'
+    fi
   fi
-  recipient=$(cat "$tmp/recipient")
-  if ! grep -qF "$recipient" "$tmp/cipher"; then warn '接続したYubiKeyが暗号文の受信者にありません'; continue; fi
+  if [ "$key_type" = yubikey ]; then
+    recipient=$(cat "$tmp/recipient")
+    if ! grep -qF "$recipient" "$tmp/cipher"; then warn '接続したYubiKeyが暗号文の受信者にありません'; continue; fi
+  fi
   printf '%s を復号します。\n' "$name"
   # 設定ファイルの中身や秘密を含み得るエラー詳細は表示しない。
   if ! env -u SOPS_AGE_KEY -u SOPS_AGE_KEY_CMD -u SOPS_AGE_SSH_PRIVATE_KEY_FILE \
     -u SOPS_AGE_SSH_PRIVATE_KEY_CMD -u SOPS_AGE_RECIPIENTS \
-    XDG_CONFIG_HOME="$tmp/config" SOPS_AGE_KEY_FILE="$tmp/selected" PATH="$tools/bin:$PATH" \
+    HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" SOPS_AGE_KEY_FILE="$tmp/selected" PATH="$tools/bin:$PATH" \
     "$tools/bin/sops" --config /dev/null decrypt --input-type binary --output-type binary "$tmp/cipher" \
     >"$tmp/plain" 2>"$tmp/error"; then
-    stty "$tty_state" </dev/tty 2>/dev/null || :
-    warn '復号に失敗しました。PINやタッチを確認してください'; blocked=1; continue
+    if [ -n "$tty_state" ]; then stty "$tty_state" </dev/tty 2>/dev/null || :; fi
+    if [ "$key_type" = yubikey ]; then
+      warn '復号に失敗しました。PINやタッチを確認してください'; blocked=1
+    else
+      warn '復号に失敗しました。指定したage鍵と受信者を確認してください'
+    fi
+    continue
   fi
-  stty "$tty_state" </dev/tty 2>/dev/null || :
+  if [ -n "$tty_state" ]; then stty "$tty_state" </dev/tty 2>/dev/null || :; fi
   chmod 400 "$tmp/plain"
   # 先に古い写しを外す。出力更新後に写しの更新が失敗しても、次回は必ず再復号する。
   rm -f -- "$snapshot"
