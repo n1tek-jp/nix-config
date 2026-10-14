@@ -1,8 +1,8 @@
-# リポジトリを置くディレクトリ（REPOS_ROOT_DIR）。スクリプトやツールがリポジトリの場所を知るために使う。
-# 端末ごとに場所を変えられるよう layer.override で包む。
+# 他の home context は config.nixConfig.reposRootDir からパスを組み立てられる。
 { layer, ... }:
 {
-  home = {
-    home.sessionVariables.REPOS_ROOT_DIR = layer.override "$HOME/repos";
+  home = { config, homeDirectory, ... }: {
+    nixConfig.reposRootDir = layer.override "${homeDirectory}/repos";
+    home.sessionVariables.REPOS_ROOT_DIR = config.nixConfig.reposRootDir;
   };
 }

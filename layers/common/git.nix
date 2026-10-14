@@ -1,6 +1,11 @@
 # Git: バージョン管理と認証ヘルパー（macOS は Git Credential Manager）。
 # 名前とメールアドレスは layers/user/.env.d/git.sops、pull の方式などの好みは user レイヤーに置く。
 {
+  backupTargets = [
+    "~/.config/git/config"
+    "~/.gitconfig"
+  ];
+
   home =
     { lib, pkgs, ... }:
     {

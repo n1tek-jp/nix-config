@@ -1,5 +1,10 @@
 # Bun: JavaScript / TypeScript の実行環境・パッケージ管理。bun install -g で入れたコマンドは ~/.bun/bin に置かれる。
 {
+  backupTargets = [
+    "~/.bun/bin/bun"
+    "~/.bun/bin/bunx"
+  ];
+
   home =
     { pkgs, ... }:
     {

@@ -17,7 +17,7 @@ let
       homeDirectory
       hostSystem
       ;
-    inherit (layers) envSecrets;
+    inherit (layers) envSecrets localValues;
   };
 in
 if !builtins.pathExists machineConfiguration then

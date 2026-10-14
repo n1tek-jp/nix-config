@@ -53,6 +53,14 @@
           throw "Unsupported Nix system: ${hostSystem}";
     in
     {
+      # switch は公開設定とパスだけを評価する。鍵本体や復号結果は読まない。
+      switchConfig = {
+        inherit (layers) secrets;
+        backupTargets = lib.unique (
+          layers.backupTargets
+          ++ lib.optionals (lib.hasSuffix "-darwin" hostSystem) (import ./bootstrap/shared.nix).backupTargets
+        );
+      };
       formatter.${hostSystem} = pkgs.nixfmt;
       packages.${hostSystem}.secret-tools = pkgs.symlinkJoin {
         name = "nix-config-secret-tools";
