@@ -43,13 +43,47 @@ class Templates(unittest.TestCase):
         self.assertEqual(self.target.parent.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.run_helper().returncode, 0)
         self.assertEqual(list(self.target.parent.glob('.nix-config-*')), [])
-    def test_raw_file_in_text_template(self):
-        self.secret.write_text('raw-value\n')
+    def test_raw_file_removes_only_one_final_newline(self):
         template = self.manifest['templates']['tool']
-        template.update(format='text', content='token=@TOKEN@')
-        template['values']['TOKEN']['key'] = None
-        self.assertEqual(self.run_helper().returncode, 0)
-        self.assertEqual(self.target.read_text(), 'token=raw-value\n')
+        cases = (
+            ('abc123', 'abc123'),
+            ('abc123\n', 'abc123'),
+            ('abc123\r\n', 'abc123'),
+            ('abc123\n\n', 'abc123\n'),
+            ('first\nsecond\n', 'first\nsecond'),
+            (' \tabc123 \t\n', ' \tabc123 \t'),
+            ('abc123\n ', 'abc123\n '),
+            ('', ''),
+            ('\n', ''),
+        )
+        for format in ('json', 'text'):
+            template.update(format=format, content='{"token": @TOKEN@}' if format == 'json' else 'token=@TOKEN@')
+            for explicit_null in (False, True):
+                template['values']['TOKEN'] = {'secret': 'api'}
+                if explicit_null:
+                    template['values']['TOKEN']['key'] = None
+                for content, expected in cases:
+                    with self.subTest(format=format, explicit_null=explicit_null, content=content):
+                        self.secret.write_bytes(content.encode())
+                        self.assertEqual(self.run_helper().returncode, 0)
+                        output = self.target.read_text()
+                        if format == 'json':
+                            self.assertEqual(json.loads(output)['token'], expected)
+                        else:
+                            self.assertEqual(output, 'token=' + expected)
+    def test_json_key_preserves_final_newlines(self):
+        template = self.manifest['templates']['tool']
+        for format in ('json', 'text'):
+            template.update(format=format, content='{"token": @TOKEN@}' if format == 'json' else 'token=@TOKEN@')
+            for token in ('abc123\n', 'first\nsecond\n\n'):
+                with self.subTest(format=format, token=token):
+                    self.secret.write_text(json.dumps({'token': token}) + '\n')
+                    self.assertEqual(self.run_helper().returncode, 0)
+                    output = self.target.read_text()
+                    if format == 'json':
+                        self.assertEqual(json.loads(output)['token'], token)
+                    else:
+                        self.assertEqual(output, 'token=' + token)
     def test_missing_secret_keeps_previous_file(self):
         self.run_helper()
         previous = self.target.read_bytes()

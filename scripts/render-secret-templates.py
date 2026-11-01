@@ -42,6 +42,9 @@ def render(manifest):
             value = source.read_text()
             if spec.get('key') is not None:
                 value = json.loads(value)[spec['key']]
+            else:
+                # read_text が CRLF を LF に揃えた後、末尾の改行を1つだけ除く。
+                value = value.removesuffix('\n')
             if template['format'] == 'json':
                 value = json.dumps(value, ensure_ascii=False)
             elif not isinstance(value, str):
